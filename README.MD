@@ -1,3 +1,5 @@
+
+
 <p align="right">
   <strong>English</strong> |
   <a href="README.zh-CN.md">中文</a>
@@ -14,7 +16,7 @@ It is helpful for customizing methuman \
 1. Copy the script **PoseMatcher.py** into your Maya and run it as a Python script.  
 2. In the UI window, specify the root joints of the Metahuman and DAZ models.  
 3. Verify that the DAZ namespace is correct.  
-4. Load the JSON file that defines the bone-pair mapping from Metahuman to your model.  Please modify by yourself if needed.
+4. Load the JSON file that defines the bone-pair mapping from Metahuman to your model.  Please modify by yourself if needed. Example JSON files are in `JsonConfig/`.
 5. Click **Load Map**.  
 6. Click **ALIGN SKELETONS**.
 
