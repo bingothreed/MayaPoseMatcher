@@ -6,6 +6,8 @@ from typing import Tuple, List
 import json
 import os
 import re
+import gzip
+import datetime
 
 ################################### Pose alignment functions Start ################################### 
 # region pose alignment
@@ -1348,6 +1350,92 @@ def export_bvh_cmd():
 #endregion
 ################################### BVH export functions End ###################################
 
+################################### DUF export functions Start ###################################
+# region duf export
+def export_daz_pose_duf(root_joint, output_path, bake_joint_orient=False):
+    """Export the current pose of the DAZ skeleton under root_joint as a DAZ Studio pose preset (.duf).
+
+    Writes the compressed-JSON pose preset format DAZ Studio saves (verified
+    against real G9 preset files). Joint names are used as-is: DAZ G8/G9 bone
+    labels match the BVH/FBX names, and the 'name://@selection/' urls make the
+    preset figure-agnostic (DAZ matches the selected figure's bones by name).
+
+    Rotation values are passed through from Maya .rotate - DAZ rotation channels
+    are in degrees and share each bone's rotation order, so values map 1:1 when
+    the scene was imported from DAZ FBX. Translation is written as 0 and scale as
+    1 (DAZ pose defaults): Maya .translate holds the bone offsets, NOT pose
+    translations, and must not be exported.
+
+    Returns the number of joints exported.
+    """
+    joints = [root_joint] + (cmds.listRelatives(root_joint, allDescendents=True, type="joint", fullPath=True) or [])
+
+    animations = []
+    for j in joints:
+        name = get_base_name(j)
+        rot = cmds.getAttr(j + ".rotate")[0]
+        if bake_joint_orient:
+            # Compose the imported rest orientation into the rotation
+            # (use when the exported pose drifts on re-import).
+            jo = cmds.getAttr(j + ".jointOrient")[0]
+            order = cmds.getAttr(j + ".rotateOrder")
+            r = om.MEulerRotation(math.radians(rot[0]), math.radians(rot[1]), math.radians(rot[2]), order)
+            jr = om.MEulerRotation(math.radians(jo[0]), math.radians(jo[1]), math.radians(jo[2]), 0)
+            m = om.MMatrix()
+            m.setToProduct(jr.asMatrix(), r.asMatrix())
+            e = om.MTransformationMatrix(m).rotation(asQuaternion=True).asEulerRotation()
+            e = e.reorderIt(order)
+            rot = (math.degrees(e.x), math.degrees(e.y), math.degrees(e.z))
+
+        entries = [("translation/x", 0.0), ("translation/y", 0.0), ("translation/z", 0.0),
+                   ("rotation/x", rot[0]), ("rotation/y", rot[1]), ("rotation/z", rot[2]),
+                   ("scale/general", 1.0), ("scale/x", 1.0), ("scale/y", 1.0), ("scale/z", 1.0)]
+        for prop, value in entries:
+            value = 0.0 if abs(value) < 1e-12 else round(float(value), 6)
+            animations.append({
+                "url": f"name://@selection/{name}:?{prop}/value",
+                "keys": [[0, value]],
+            })
+
+    doc = {
+        "file_version": "0.6.2.0",
+        "asset_info": {
+            "id": "/Presets/Poses/" + os.path.basename(output_path),
+            "type": "preset_pose",
+            "contributor": {"author": "", "email": "", "website": ""},
+            "revision": "1.0",
+            "modified": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        },
+        "scene": {"animations": animations},
+    }
+    data = json.dumps(doc, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    with gzip.GzipFile(filename=output_path, mode="wb", compresslevel=9, mtime=0) as fp:
+        fp.write(data)
+    return len(joints)
+
+def export_duf_cmd():
+    """Export the current DAZ pose as a DAZ Studio pose preset (.duf)."""
+    daz_root = cmds.textField("dazRootField", query=True, text=True)
+    out_path = cmds.textField("dufPathField", query=True, text=True)
+
+    if not daz_root or not cmds.objExists(daz_root):
+        cmds.warning("⚠️ Set the DAZ root joint first")
+        return
+    if not out_path:
+        cmds.warning("⚠️ Set an output DUF file path first")
+        return
+    if not out_path.lower().endswith(".duf"):
+        out_path += ".duf"
+        cmds.textField("dufPathField", edit=True, text=out_path)
+
+    try:
+        count = export_daz_pose_duf(daz_root, out_path)
+        cmds.warning(f"📦 Exported pose DUF: {out_path} ({count} joints)")
+    except Exception as e:
+        cmds.warning(f"⚠️ DUF export failed: {str(e)}")
+
+#endregion
+################################### DUF export functions End ###################################
 
 def create_alignment_ui():
     """Create the UI window"""
@@ -1547,6 +1635,36 @@ def create_alignment_ui():
 
     cmds.gridLayout(numberOfColumns=1, cellWidth=500)
     cmds.button(label="Export DAZ Pose as BVH", command=lambda *_: export_bvh_cmd(), height=30)
+    cmds.setParent("..")
+    cmds.setParent("..")
+
+    # ================ DUF export ================
+    duf_frame = cmds.frameLayout(
+        label="DUF Export (DAZ Pose Preset)",
+        collapsable=True,
+        borderStyle="etchedIn",
+        marginWidth=5,
+        marginHeight=5
+    )
+    cmds.gridLayout(numberOfColumns=3, cellWidth=170)
+    cmds.text(label="Output DUF:", align="right")
+    duf_path_field = cmds.textField("dufPathField", width=120)
+    cmds.button(
+        label="Browse...",
+        annotation="Where to save the pose preset. Put it in a DAZ content folder (e.g. .../My Library/Presets/Poses) to see it in DAZ Studio.",
+        command=lambda *_: cmds.textField(
+            duf_path_field,
+            e=True,
+            text=(cmds.fileDialog2(
+                fileMode=0,
+                fileFilter="DAZ Pose Preset (*.duf)"
+            ) or [""])[0]
+        )
+    )
+    cmds.setParent("..")
+
+    cmds.gridLayout(numberOfColumns=1, cellWidth=500)
+    cmds.button(label="Export DAZ Pose as DUF", command=lambda *_: export_duf_cmd(), height=30)
     cmds.setParent("..")
     cmds.setParent("..")
 
