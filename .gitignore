@@ -1,0 +1,7 @@
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Maya temp files
+*.swatches
