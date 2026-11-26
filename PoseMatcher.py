@@ -765,7 +765,7 @@ def get_selected_meshes_numpy(mode="merge") -> List[Tuple[str, np.ndarray, np.nd
     elif(mode=="split"):
         if sel_list.length() != 1:
             cmds.confirmDialog(title='Error', message='Please select only one mesh!', icon='critical')
-            raise RuntimeError("Please select only onetwo mesh!")
+            raise RuntimeError("Please select only one mesh!")
 
     results = []
     for i in range(sel_list.length()):
@@ -837,25 +837,27 @@ def detect_and_select_overlaps(name1,name2,v1,v2,decimals: int = 3):
 # --------------------------------------------------
 # 将顶点和面写入obj
 def writeWithColor(f,v,uv,vn,IdxsWithColor,name):
-    fp = open(name,'w')
+    """Write v/vt/vn/f to an OBJ file (buffered for large meshes)."""
+    color_set = set(IdxsWithColor) if len(IdxsWithColor) else set()
+    lines = []
     for i in range(v.shape[0]):
-        if(IdxsWithColor!=[]):
-            if i in IdxsWithColor:
-                fp.write("v {0} {1} {2} 1 0 0\n".format(v[i,0],v[i,1],v[i,2]))
+        if(color_set):
+            if i in color_set:
+                lines.append("v {0} {1} {2} 1 0 0\n".format(v[i,0],v[i,1],v[i,2]))
             else:
-                fp.write("v {0} {1} {2} 1 1 1\n".format(v[i,0],v[i,1],v[i,2]))
+                lines.append("v {0} {1} {2} 1 1 1\n".format(v[i,0],v[i,1],v[i,2]))
         else:
-            fp.write("v {0} {1} {2}\n".format(v[i,0],v[i,1],v[i,2]))
+            lines.append("v {0} {1} {2}\n".format(v[i,0],v[i,1],v[i,2]))
     for i in range(uv.shape[0]):        
-        fp.write("vt {0} {1}\n".format(uv[i,0],uv[i,1]))
+        lines.append("vt {0} {1}\n".format(uv[i,0],uv[i,1]))
     for i in range(vn.shape[0]):        
-        fp.write("vn {0} {1} {2}\n".format(vn[i,0],vn[i,1],vn[i,2]))
+        lines.append("vn {0} {1} {2}\n".format(vn[i,0],vn[i,1],vn[i,2]))
     curr_fid = -1
     for i in range(f.shape[0]):
         if(f[i,0]==curr_fid):
-            fp.write(" {0}/{1}/{2}".format(f[i,1]+1,f[i,2]+1,f[i,3]+1))
+            lines.append(" {0}/{1}/{2}".format(f[i,1]+1,f[i,2]+1,f[i,3]+1))
         else:
-            fp.write("\nf {0}/{1}/{2}".format(f[i,1]+1,f[i,2]+1,f[i,3]+1))
+            lines.append(("" if curr_fid == -1 else "\n") + "f {0}/{1}/{2}".format(f[i,1]+1,f[i,2]+1,f[i,3]+1))
             curr_fid = f[i,0]
     # for i in range(len(f)):
     #     for j in range(len(f[i])):
@@ -865,36 +867,29 @@ def writeWithColor(f,v,uv,vn,IdxsWithColor,name):
     #             fp.write("{0} ".format(f[i][j]+1))
     #         if(j==len(f[i])-1):
     #             fp.write("\n")       
-    fp.close()
+    with open(name, 'w', encoding='utf-8') as fp:
+        fp.write(''.join(lines))
 
-def ProcessVertices(mesh1_v,mesh2_v,overlap1,overlap2):
-    cmds.progressWindow(
-        title='vertices...',
-        progress=0,
-        status='0 / %d' % mesh2_v.shape[0],
-        isInterruptable=True
-    )
-    cmds.refresh()
-    total_v = mesh1_v.copy()
-    map_v = np.array([], dtype=np.int32)
-    for i in range(mesh2_v.shape[0]):
-        if cmds.progressWindow(query=True, isCancelled=True):
-            cmds.warning('用户取消！')
-            break
+def ProcessVertices(mesh1_v, mesh2_v, overlap1, overlap2):
+    """Merge mesh2's vertices into mesh1, welding the overlapping ones.
 
-        if(i not in overlap2):
-            total_v = np.vstack([total_v,mesh2_v[i,...]])
-            map_v = np.hstack([map_v, np.array([total_v.shape[0]-1], dtype=np.int32)])
-        else:
-            indices = np.where(i == overlap2)[0]
-            map_v = np.hstack([map_v,overlap1[indices[0]]])
+    Returns (merged_vertices, map_v) where map_v maps each mesh2 vertex
+    index to its index in the merged vertex array.
+    """
+    n1 = mesh1_v.shape[0]
+    n2 = mesh2_v.shape[0]
+    map_v = np.empty(n2, dtype=np.int32)
 
-        # ---- 更新进度 ----
-        percent = float(i + 1) / mesh2_v.shape[0] * 100
-        cmds.progressWindow(edit=True,
-                          progress=percent,
-                          status='%d / %d' % (i + 1, mesh2_v.shape[0]))
-    cmds.progressWindow(endProgress=True)
+    is_overlap = np.zeros(n2, dtype=bool)
+    is_overlap[overlap2] = True
+
+    keep_count = int(np.count_nonzero(~is_overlap))
+    map_v[~is_overlap] = n1 + np.arange(keep_count, dtype=np.int32)
+    # overlap1/overlap2 are paired positionally (sorted by coordinate value,
+    # not by index), so fancy indexing keeps the pairing correct.
+    map_v[overlap2] = overlap1
+
+    total_v = np.concatenate([mesh1_v, mesh2_v[~is_overlap]], axis=0)
     return total_v, map_v
 
 def is_overlap(a, b):
@@ -913,48 +908,33 @@ def is_overlap(a, b):
     # 反推：两个方向都不“不重叠”才重叠
     return not (no_overlap_x or no_overlap_y)
 
-def ProcessUV(mesh1_uv,mesh2_uv):
-    merged_uv = mesh1_uv.copy()
+def ProcessUV(mesh1_uv, mesh2_uv):
+    """Append mesh2's UVs to mesh1's, shifting mesh2's U range out of the way when ranges overlap."""
+    mesh2_uv = mesh2_uv.copy()  # avoid mutating the caller's array
     uv1_range = [math.floor(min(mesh1_uv[...,0])), math.floor(min(mesh1_uv[...,1])),math.ceil(max(mesh1_uv[...,0])), math.ceil(max(mesh1_uv[...,1]))]
     uv2_range = [math.floor(min(mesh2_uv[...,0])), math.floor(min(mesh2_uv[...,1])),math.ceil(max(mesh2_uv[...,0])), math.ceil(max(mesh2_uv[...,1]))]
-    if(is_overlap(uv1_range,uv2_range)):
-        if(uv1_range[0]<uv2_range[0]):
-            mesh2_uv[...,0] += uv1_range[3]-uv2_range[0]
-    merged_uv = np.vstack([mesh1_uv,mesh2_uv])
+    if is_overlap(uv1_range, uv2_range):
+        # Shift no matter which side mesh2 starts on (the old code only
+        # shifted when mesh1 started left of mesh2, leaving overlaps otherwise).
+        mesh2_uv[...,0] += uv1_range[3] - uv2_range[0]
+    merged_uv = np.vstack([mesh1_uv, mesh2_uv])
     map_uv = np.arange(mesh2_uv.shape[0]) + mesh1_uv.shape[0]
     return merged_uv, map_uv
 
 def ProcessVN(mesh1_vn,mesh2_vn):
     return np.vstack([mesh1_vn,mesh2_vn]), np.arange(mesh2_vn.shape[0])+mesh1_vn.shape[0]
 
-def ProcessFaces(mesh1_f,mesh2_f,map_v,map_uv,map_vn):
-    cmds.progressWindow(
-        title='faces...',
-        progress=0,
-        status='0 / %d' % mesh2_f.shape[0],
-        isInterruptable=True
-    )
-    cmds.refresh()
-    merged_f = mesh1_f.copy()
-    for i in range(mesh2_f.shape[0]):
-        # ---- 每帧检查是否用户点了取消 ----
-        if cmds.progressWindow(query=True, isCancelled=True):
-            cmds.warning('用户取消！')
-            break
-
-        cur_face_id = mesh2_f[i,0] + mesh1_f.shape[0]
-        cur_vert_id = map_v[mesh2_f[i,1]]
-        cur_uv_id = map_uv[mesh2_f[i,2]]
-        cur_norm_id = map_vn[mesh2_f[i,3]]
-        merged_f = np.vstack([merged_f,np.column_stack((cur_face_id, cur_vert_id, cur_uv_id, cur_norm_id)).astype(np.int32)])
-
-        # ---- 更新进度 ----
-        percent = float(i + 1) / mesh2_f.shape[0] * 100
-        cmds.progressWindow(edit=True,
-                          progress=percent,
-                          status='%d / %d' % (i + 1, mesh2_f.shape[0]))
-    cmds.progressWindow(endProgress=True)
-    return merged_f
+def ProcessFaces(mesh1_f, mesh2_f, map_v, map_uv, map_vn):
+    """Remap mesh2's face-vertex table into the merged index spaces and append it to mesh1's."""
+    # Face ids are 0-based and contiguous, so offset mesh2's ids by mesh1's face count.
+    n1_faces = int(mesh1_f[-1, 0]) + 1
+    mesh2_remapped = np.column_stack((
+        mesh2_f[:, 0] + n1_faces,
+        map_v[mesh2_f[:, 1]],
+        map_uv[mesh2_f[:, 2]],
+        map_vn[mesh2_f[:, 3]],
+    )).astype(np.int32)
+    return np.concatenate([mesh1_f, mesh2_remapped], axis=0)
 
 def MergeMeshes(folder_path,mesh1_f,mesh2_f,mesh1_v,mesh2_v,mesh1_uv,mesh2_uv,mesh1_vn,mesh2_vn,overlap1,overlap2):
     merged_v, map_v = ProcessVertices(mesh1_v,mesh2_v,overlap1,overlap2)
@@ -962,47 +942,70 @@ def MergeMeshes(folder_path,mesh1_f,mesh2_f,mesh1_v,mesh2_v,mesh1_uv,mesh2_uv,me
     merged_vn, map_vn = ProcessVN(mesh1_vn,mesh2_vn)
     merged_f = ProcessFaces(mesh1_f,mesh2_f,map_v,map_uv,map_vn)
 
-    json_data = {}
-    json_data["num_vertices_mesh1"] = mesh1_v.shape[0]
-    json_data["num_vertices_mesh2"] = mesh2_v.shape[0]
-    # json_data["overlap1"] = overlap1.tolist()
-    # json_data["overlap2"] = overlap2.tolist()
-    json_data["map_v"] = map_v.tolist()
-    json_data["uv_mesh1"] = mesh1_uv.tolist()
-    json_data["uv_mesh2"] = mesh2_uv.tolist()
-    json_data["faces_mesh1"] = mesh1_f.tolist()
-    json_data["faces_mesh2"] = mesh2_f.tolist()
-    # 写入 JSON 文件
-    with open(folder_path + "_MergeInfo.json", "w", encoding="utf-8") as f:
-        json.dump(json_data, f, indent=4)
+    # Store merge info in .npz (much smaller/faster than JSON for large meshes).
+    np.savez(
+        folder_path + "_MergeInfo.npz",
+        num_vertices_mesh1=mesh1_v.shape[0],
+        num_vertices_mesh2=mesh2_v.shape[0],
+        map_v=map_v,
+        uv_mesh1=mesh1_uv,
+        uv_mesh2=mesh2_uv,
+        faces_mesh1=mesh1_f,
+        faces_mesh2=mesh2_f,
+    )
 
     return merged_f, merged_v,merged_uv,merged_vn
 
-def SplitMeshes(mesh_name,jsonPath, merged_v, merged_vn):
-    with open(jsonPath, "r", encoding="utf-8") as f:
-        json_data = json.load(f)          # data 就是原来的 dict
-    
-    mesh1_v_num = np.array(json_data["num_vertices_mesh1"])
-    mesh2_v_num = np.array(json_data["num_vertices_mesh2"])
-    # overlap1 = json_data["overlap1"]
-    # overlap2 = json_data["overlap2"]
-    map_v = json_data["map_v"]
-    mesh1_uv = np.array(json_data["uv_mesh1"])
-    mesh2_uv = np.array(json_data["uv_mesh2"])
-    mesh1_f = np.array(json_data["faces_mesh1"])
-    mesh2_f = np.array(json_data["faces_mesh2"])
+def load_merge_info(info_path):
+    """Load merge info from the new .npz sidecar or a legacy .json one."""
+    if info_path.lower().endswith(".npz"):
+        with np.load(info_path, allow_pickle=False) as data:
+            return {
+                "num_vertices_mesh1": int(data["num_vertices_mesh1"]),
+                "num_vertices_mesh2": int(data["num_vertices_mesh2"]),
+                "map_v": data["map_v"],
+                "uv_mesh1": data["uv_mesh1"],
+                "uv_mesh2": data["uv_mesh2"],
+                "faces_mesh1": data["faces_mesh1"],
+                "faces_mesh2": data["faces_mesh2"],
+            }
+    # legacy JSON format
+    with open(info_path, "r", encoding="utf-8") as f:
+        json_data = json.load(f)
+    return {
+        "num_vertices_mesh1": int(json_data["num_vertices_mesh1"]),
+        "num_vertices_mesh2": int(json_data["num_vertices_mesh2"]),
+        "map_v": np.array(json_data["map_v"], dtype=np.int32),
+        "uv_mesh1": np.array(json_data["uv_mesh1"]),
+        "uv_mesh2": np.array(json_data["uv_mesh2"]),
+        "faces_mesh1": np.array(json_data["faces_mesh1"], dtype=np.int32),
+        "faces_mesh2": np.array(json_data["faces_mesh2"], dtype=np.int32),
+    }
+
+def SplitMeshes(mesh_name, info_path, merged_v, merged_vn):
+    info = load_merge_info(info_path)
+    mesh1_v_num = info["num_vertices_mesh1"]
+    mesh2_v_num = info["num_vertices_mesh2"]
+    map_v = info["map_v"]
+    mesh1_uv = info["uv_mesh1"]
+    mesh2_uv = info["uv_mesh2"]
+    mesh1_f = info["faces_mesh1"]
+    mesh2_f = info["faces_mesh2"]
+    base_dir = os.path.dirname(info_path)
+    safe_name = mesh_name.replace(":", "_")
 
     # get mesh1
     split_v_mesh1 = np.array(merged_v[0:mesh1_v_num,...])
     split_vn_mesh1 = np.array(merged_vn[0:mesh1_v_num,...])
-    writeWithColor(mesh1_f,split_v_mesh1,mesh1_uv,split_vn_mesh1,[],os.path.dirname(jsonPath)+"/"+mesh_name.replace(":","_")+"_Part1.obj")
-    build_mesh_from_numpy(split_v_mesh1,mesh1_uv,mesh1_f,split_vn_mesh1,mesh_name+"_Part1")
+    writeWithColor(mesh1_f, split_v_mesh1, mesh1_uv, split_vn_mesh1, [], os.path.join(base_dir, safe_name + "_Part1.obj"))
+    build_mesh_from_numpy(split_v_mesh1, mesh1_uv, mesh1_f, split_vn_mesh1, mesh_name + "_Part1")
 
     # get mesh2
-    split_vn_mesh2 = merged_vn[map_v,...]
-    split_v_mesh2 = merged_v[map_v,...]
-    writeWithColor(mesh2_f,split_v_mesh2,mesh2_uv,split_vn_mesh2,[],os.path.dirname(jsonPath)+"/"+mesh_name.replace(":","_")+"_Part2.obj")
-    build_mesh_from_numpy(split_v_mesh2,mesh2_uv,mesh2_f,split_vn_mesh2,mesh_name+"_Part2")
+    # vn was never deduplicated: mesh2's normals are the tail mesh2_v_num entries of merged_vn
+    split_vn_mesh2 = np.array(merged_vn[mesh1_v_num:mesh1_v_num + mesh2_v_num, ...])
+    split_v_mesh2 = np.array(merged_v[map_v, ...])
+    writeWithColor(mesh2_f, split_v_mesh2, mesh2_uv, split_vn_mesh2, [], os.path.join(base_dir, safe_name + "_Part2.obj"))
+    build_mesh_from_numpy(split_v_mesh2, mesh2_uv, mesh2_f, split_vn_mesh2, mesh_name + "_Part2")
 
 def assign_lambert_to_mesh(mesh_transform, color=(0.5, 0.5, 0.5)):
     """给 transform 指定一个 Lambert 材质"""
@@ -1077,11 +1080,14 @@ def MergeMeshes_cmd():
 
         name1, name2, overlap_idx1, overlap_idx2 = detect_and_select_overlaps(name1,name2,v1,v2,decimals=3)
         select_vertices(name1, overlap_idx1)
-        # select_vertices(name2, idx2)
-        merged_f, merged_v,merged_uv,merged_vn = MergeMeshes(os.path.splitext(filePath[0])[0],vt1,vt2,v1,v2,uv1,uv2,vn1,vn2,overlap_idx1,overlap_idx2)
-        filename = os.path.splitext(os.path.basename(filePath[0]))[0]
-        build_mesh_from_numpy(merged_v,merged_uv,merged_f, merged_vn, name=filename)
-        writeWithColor(merged_f,merged_v,merged_uv,merged_vn, [], filePath[0])
+        cmds.waitCursor(state=True)
+        try:
+            merged_f, merged_v,merged_uv,merged_vn = MergeMeshes(os.path.splitext(filePath[0])[0],vt1,vt2,v1,v2,uv1,uv2,vn1,vn2,overlap_idx1,overlap_idx2)
+            filename = os.path.splitext(os.path.basename(filePath[0]))[0]
+            build_mesh_from_numpy(merged_v,merged_uv,merged_f, merged_vn, name=filename)
+            writeWithColor(merged_f,merged_v,merged_uv,merged_vn, [], filePath[0])
+        finally:
+            cmds.waitCursor(state=False)
 
 # -------------------------------------------------
 # 弹窗：让用户选 txt，然后决定读还是写
@@ -1090,7 +1096,7 @@ def SplitMeshes_cmd():
     global g_lastPath
     path = cmds.fileDialog2(fileMode=1,  # 1 = 单选已存在文件
                             startingDirectory=g_lastPath,
-                            fileFilter="json Files (*.json);;All Files (*)")
+                            fileFilter="Merge Info Files (*_MergeInfo.npz *.json);;All Files (*)")
     if path:
         g_lastPath = os.path.dirname(path[0])
         meshes = get_selected_meshes_numpy("split")
