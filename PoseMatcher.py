@@ -1104,7 +1104,251 @@ def SplitMeshes_cmd():
         SplitMeshes(meshName.rsplit('|', 1)[-1],path[0], merged_v, merged_vn)
         
 #endregion
-################################### Merge/Split meshes functions End ################################### 
+################################### Merge/Split meshes functions End ###################################
+
+################################### BVH export functions Start ###################################
+# region bvh export
+def _bvh_normalize(name):
+    """Normalize a joint name for matching (case/underscore/namespace-insensitive)."""
+    return re.sub(r"[^a-z0-9]", "", name.lower())
+
+def parse_bvh_hierarchy(bvh_path):
+    """Parse the HIERARCHY section of a BVH file into a dict tree.
+
+    Each node: {"name", "offset", "channels", "children", "end_site"}
+    """
+    with open(bvh_path, "r", encoding="utf-8") as fp:
+        text = fp.read().split("MOTION", 1)[0]
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+
+    def parse_block(i):
+        parts = lines[i].split()
+        node = {"name": parts[1] if len(parts) > 1 else None,
+                "offset": None, "channels": [], "children": [], "end_site": None}
+        i += 1
+        if lines[i] != "{":
+            raise RuntimeError("Malformed BVH hierarchy: expected '{' after node name")
+        i += 1
+        while lines[i] != "}":
+            line = lines[i]
+            if line.startswith("OFFSET"):
+                node["offset"] = [float(x) for x in line.split()[1:4]]
+                i += 1
+            elif line.startswith("CHANNELS"):
+                toks = line.split()
+                node["channels"] = toks[2:2 + int(toks[1])]
+                i += 1
+            elif line.startswith("JOINT"):
+                child, i = parse_block(i)
+                node["children"].append(child)
+            elif line.startswith("End Site"):
+                i += 1  # consume "End Site"
+                if lines[i] != "{":
+                    raise RuntimeError("Malformed BVH End Site: expected '{'")
+                i += 1
+                node["end_site"] = [float(x) for x in lines[i].split()[1:4]]
+                i += 2  # consume the OFFSET line and the closing "}"
+            else:
+                i += 1  # tolerate unknown lines
+        return node, i + 1  # consume "}"
+
+    start = next(i for i, l in enumerate(lines) if l.startswith("ROOT"))
+    root, _ = parse_block(start)
+    return root
+
+def _maya_rot_to_bvh(joint, channel_names, bake_joint_orient=False):
+    """Convert a Maya joint's local rotation to values in the given BVH channel order.
+
+    Returns {channel_name: degrees}. The joint's rotateOrder is converted properly
+    via quaternion. jointOrient is left out by default: it represents the imported
+    rig's local frame, which the target tool applies itself on import.
+    """
+    rot = cmds.getAttr(joint + ".rotate")[0]
+    order = cmds.getAttr(joint + ".rotateOrder")
+    e = om.MEulerRotation(math.radians(rot[0]), math.radians(rot[1]), math.radians(rot[2]), order)
+    if bake_joint_orient:
+        jo = cmds.getAttr(joint + ".jointOrient")[0]
+        jo_e = om.MEulerRotation(math.radians(jo[0]), math.radians(jo[1]), math.radians(jo[2]), 0)
+        m = om.MMatrix()
+        m.setToProduct(jo_e.asMatrix(), e.asMatrix())
+        q = om.MTransformationMatrix(m).rotation(asQuaternion=True)
+    else:
+        q = e.asQuaternion()
+    bvh_euler = q.asEulerRotation()
+    order_map = {"XYZ": 0, "YZX": 1, "ZXY": 2, "XZY": 3, "YXZ": 4, "ZYX": 5}
+    order_str = "".join(c[0].upper() for c in channel_names)  # e.g. "ZXY"
+    if order_str in order_map:
+        bvh_euler = bvh_euler.reorderIt(order_map[order_str])
+    axis_map = {"Xrotation": "x", "Yrotation": "y", "Zrotation": "z"}
+    return {c: math.degrees(getattr(bvh_euler, axis_map[c])) for c in channel_names}
+
+def _build_bvh_template_from_maya(root_joint):
+    """Build a BVH template tree from the Maya joint hierarchy (DAZ convention channel order)."""
+    def build(joint, is_root):
+        node = {
+            "name": get_base_name(joint),
+            "offset": [float(x) for x in cmds.getAttr(joint + ".translate")[0]],
+            "channels": (["Xposition", "Yposition", "Zposition", "Zrotation", "Xrotation", "Yrotation"]
+                         if is_root else ["Zrotation", "Xrotation", "Yrotation"]),
+            "children": [], "end_site": None,
+            "_maya": joint,
+        }
+        children = cmds.listRelatives(joint, children=True, type="joint", fullPath=True) or []
+        if children:
+            for child in children:
+                node["children"].append(build(child, False))
+        else:
+            node["end_site"] = [0.0, 0.0, 0.0]
+        return node
+    return build(root_joint, True)
+
+def _match_maya_to_template(template, root_joint):
+    """Match Maya joints to template nodes by normalized name; fill node['_maya'].
+
+    Maya joints missing from the template are appended under their matched
+    template ancestor so no pose data is lost.
+    """
+    lookup = {}
+    def index(node):
+        lookup[_bvh_normalize(node["name"])] = node
+        for child in node["children"]:
+            index(child)
+    index(template)
+
+    def walk(maya_joint, parent_node):
+        node = lookup.get(_bvh_normalize(get_base_name(maya_joint)))
+        if node is None:
+            node = {
+                "name": get_base_name(maya_joint),
+                "offset": [float(x) for x in cmds.getAttr(maya_joint + ".translate")[0]],
+                "channels": ["Zrotation", "Xrotation", "Yrotation"],
+                "children": [], "end_site": None,
+                "_maya": maya_joint,
+            }
+            parent_node["children"].append(node)
+        else:
+            node["_maya"] = maya_joint
+        children = cmds.listRelatives(maya_joint, children=True, type="joint", fullPath=True) or []
+        for child in children:
+            walk(child, node)
+
+    walk(root_joint, template)
+
+    # Appended leaves need an End Site (some importers require it).
+    def fill_end_sites(node):
+        if not node["children"] and node["end_site"] is None:
+            node["end_site"] = [0.0, 0.0, 0.0]
+        for child in node["children"]:
+            fill_end_sites(child)
+    fill_end_sites(template)
+
+def _bvh_write_hierarchy(node, indent, is_root, lines):
+    pad = "\t" * indent
+    lines.append(f"{pad}{'ROOT' if is_root else 'JOINT'} {node['name']}")
+    lines.append(pad + "{")
+    off = node["offset"] or [0.0, 0.0, 0.0]
+    lines.append(f"{pad}\tOFFSET {off[0]:.6f} {off[1]:.6f} {off[2]:.6f}")
+    channels = node["channels"]
+    lines.append(f"{pad}\tCHANNELS {len(channels)} {' '.join(channels)}")
+    for child in node["children"]:
+        _bvh_write_hierarchy(child, indent + 1, False, lines)
+    if node["end_site"] is not None:
+        es = node["end_site"]
+        lines.append(f"{pad}\tEnd Site")
+        lines.append(f"{pad}\t{{")
+        lines.append(f"{pad}\t\tOFFSET {es[0]:.6f} {es[1]:.6f} {es[2]:.6f}")
+        lines.append(f"{pad}\t}}")
+    lines.append(pad + "}")
+
+def _bvh_collect_frame(node, root_pos, bake_joint_orient, values):
+    """Append this node's channel values (depth-first) to values."""
+    pos_map = {"Xposition": root_pos[0], "Yposition": root_pos[1], "Zposition": root_pos[2]}
+    rot_channels = [c for c in node["channels"] if c.endswith("rotation")]
+    rot_map = {}
+    if node.get("_maya") and rot_channels:
+        rot_map = _maya_rot_to_bvh(node["_maya"], rot_channels, bake_joint_orient)
+    for ch in node["channels"]:
+        if ch in pos_map:
+            values.append(pos_map[ch])
+        elif ch in rot_map:
+            values.append(rot_map[ch])
+        else:
+            values.append(0.0)
+    for child in node["children"]:
+        _bvh_collect_frame(child, root_pos, bake_joint_orient, values)
+
+def export_daz_pose_bvh(root_joint, output_path, reference_bvh=None,
+                        frame_time=1.0 / 30.0, bake_joint_orient=False):
+    """Export the current pose of the skeleton under root_joint as a single-frame BVH.
+
+    If reference_bvh is given, its HIERARCHY (joint names, offsets, End Sites,
+    channel order) is used as the template so the output stays compatible with
+    the tool that produced the reference (e.g. DAZ Studio). Maya joints are
+    matched by normalized name (case/underscore/namespace-insensitive); template
+    joints without a Maya match export zero rotation, extra Maya joints are
+    appended under their matched ancestor.
+
+    Returns the number of joints that got rotation data from Maya.
+    """
+    template = None
+    if reference_bvh and os.path.exists(reference_bvh):
+        template = parse_bvh_hierarchy(reference_bvh)
+        _match_maya_to_template(template, root_joint)
+    else:
+        if reference_bvh:
+            cmds.warning(f"⚠️ Reference BVH not found: {reference_bvh}, exporting the Maya hierarchy as-is")
+        template = _build_bvh_template_from_maya(root_joint)
+
+    root_pos = cmds.xform(root_joint, query=True, worldSpace=True, translation=True)
+
+    lines = ["HIERARCHY"]
+    _bvh_write_hierarchy(template, 0, True, lines)
+    lines.append("MOTION")
+    lines.append("Frames: 1")
+    lines.append("Frame Time: %.7f" % frame_time)
+    values = []
+    _bvh_collect_frame(template, root_pos, bake_joint_orient, values)
+    lines.append(" ".join("%.6f" % v for v in values))
+
+    with open(output_path, "w", encoding="utf-8") as fp:
+        fp.write("\n".join(lines) + "\n")
+
+    matched = 0
+    def count(node):
+        nonlocal matched
+        if node.get("_maya"):
+            matched += 1
+        for child in node["children"]:
+            count(child)
+    count(template)
+    return matched
+
+def export_bvh_cmd():
+    """Export the current DAZ pose as a BVH file."""
+    daz_root = cmds.textField("dazRootField", query=True, text=True)
+    out_path = cmds.textField("bvhPathField", query=True, text=True)
+    ref_path = cmds.textField("bvhRefField", query=True, text=True) or None
+
+    if not daz_root or not cmds.objExists(daz_root):
+        cmds.warning("⚠️ Set the DAZ root joint first")
+        return
+    if not out_path:
+        cmds.warning("⚠️ Set an output BVH file path first")
+        return
+    if not out_path.lower().endswith(".bvh"):
+        out_path += ".bvh"
+        cmds.textField("bvhPathField", edit=True, text=out_path)
+
+    try:
+        matched = export_daz_pose_bvh(daz_root, out_path, reference_bvh=ref_path)
+        cmds.warning(f"📦 Exported pose BVH: {out_path} ({matched} joints with pose data)")
+    except Exception as e:
+        cmds.warning(f"⚠️ BVH export failed: {str(e)}")
+
+#endregion
+################################### BVH export functions End ###################################
+
+
 def create_alignment_ui():
     """Create the UI window"""
     win_name = "skeletonAlignmentUI"
@@ -1112,14 +1356,14 @@ def create_alignment_ui():
         cmds.deleteUI(win_name)
     
     # Create main window - Fixed size to ensure all content is visible
-    cmds.window(win_name, title="Skeleton Alignment Tool", width=520, height=700, sizeable=False)
-    
+    cmds.window(win_name, title="Skeleton Alignment Tool", width=520, height=880, sizeable=False)
+
     # Main layout - Vertical column layout
     main_layout = cmds.columnLayout(
         adjustableColumn=True,
         columnAttach=('both', 5),
         rowSpacing=10,
-        height=690
+        height=870
     )
     
     # ================ set skeleton ================
@@ -1257,7 +1501,55 @@ def create_alignment_ui():
     cmds.button(label="Merge to one mesh", command=lambda *_: MergeMeshes_cmd(), height=30)
     cmds.button(label="Restore to two meshes", command=lambda *_: SplitMeshes_cmd(), height=30)
     cmds.setParent("..")
-    
+    cmds.setParent("..")
+
+    # ================ BVH export ================
+    bvh_frame = cmds.frameLayout(
+        label="BVH Export",
+        collapsable=True,
+        borderStyle="etchedIn",
+        marginWidth=5,
+        marginHeight=5
+    )
+    cmds.gridLayout(numberOfColumns=3, cellWidth=170)
+    cmds.text(label="Output BVH:", align="right")
+    bvh_path_field = cmds.textField("bvhPathField", width=120)
+    cmds.button(
+        label="Browse...",
+        annotation="Where to save the exported pose BVH",
+        command=lambda *_: cmds.textField(
+            bvh_path_field,
+            e=True,
+            text=(cmds.fileDialog2(
+                fileMode=0,
+                fileFilter="BVH Files (*.bvh)"
+            ) or [""])[0]
+        )
+    )
+    cmds.setParent("..")
+
+    cmds.gridLayout(numberOfColumns=3, cellWidth=170)
+    cmds.text(label="Reference BVH:", align="right")
+    bvh_ref_field = cmds.textField("bvhRefField", width=120)
+    cmds.button(
+        label="Browse...",
+        annotation="Optional: a BVH from DAZ for the same character. Its hierarchy/names/channel order are used as the export template so the result re-imports cleanly.",
+        command=lambda *_: cmds.textField(
+            bvh_ref_field,
+            e=True,
+            text=(cmds.fileDialog2(
+                fileMode=1,
+                fileFilter="BVH Files (*.bvh)"
+            ) or [""])[0]
+        )
+    )
+    cmds.setParent("..")
+
+    cmds.gridLayout(numberOfColumns=1, cellWidth=500)
+    cmds.button(label="Export DAZ Pose as BVH", command=lambda *_: export_bvh_cmd(), height=30)
+    cmds.setParent("..")
+    cmds.setParent("..")
+
     # initialize
     reset_table()
     
