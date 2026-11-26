@@ -208,9 +208,18 @@ def getNeedRot(v1:om.MVector,v2:om.MVector):
 
 def align_parent_to_vector(child_joint, target_vector):
     """Align the parent joint's direction toward its child joint with the target vector."""    
-    parent_joint = cmds.listRelatives(child_joint, parent=True, fullPath=True)[0]
-    if(("twist" in parent_joint.rsplit('|', 1)[-1]) or ("Twist" in parent_joint.rsplit('|', 1)[-1]) or ("Meta" in parent_joint.rsplit('|', 1)[-1]) or ("meta" in parent_joint.rsplit('|', 1)[-1])):
-        parent_joint = cmds.listRelatives(parent_joint, parent=True, fullPath=True)[0]
+    parents = cmds.listRelatives(child_joint, parent=True, fullPath=True)
+    if not parents:
+        cmds.warning(f"⚠️ {get_base_name(child_joint)} has no parent to align")
+        return
+    parent_joint = parents[0]
+    parent_base = get_base_name(parent_joint)
+    if any(tag in parent_base for tag in ("twist", "Twist", "Meta", "meta")):
+        next_parents = cmds.listRelatives(parent_joint, parent=True, fullPath=True)
+        if not next_parents:
+            cmds.warning(f"⚠️ {get_base_name(child_joint)}'s chain ends at '{parent_base}', cannot align")
+            return
+        parent_joint = next_parents[0]
     parent_delta_global_rot = get_parent_delta_global_rot(parent_joint)
     
     # get the position of child and parent joint
@@ -241,30 +250,29 @@ def align_parent_to_vector(child_joint, target_vector):
     order = getRotOrder(parent_joint)
     ordered_euler = new_rot_euler.reorderIt(order)
     # Apply the rotation to the parent joint's local rotation.
-    print(f"Adjust {parent_joint}")
     cmds.setAttr(parent_joint + '.rotateX', math.degrees(ordered_euler[0]))
     cmds.setAttr(parent_joint + '.rotateY', math.degrees(ordered_euler[1]))
     cmds.setAttr(parent_joint + '.rotateZ', math.degrees(ordered_euler[2]))
 
-def find_joint_by_base_name(base_name, root_joint):
-    """Find joints with the same base name under the specified root joint and return full path."""
+def get_joint_name_map(root_joint):
+    """Build a {base_name: full_path} dict for all joints under root_joint (one pass)."""
     all_joints = cmds.listRelatives(root_joint, allDescendents=True, type="joint", fullPath=True) or []
     all_joints.append(cmds.ls(root_joint, long=True)[0])
-    
+    name_map = {}
     for joint in all_joints:
-        short_name = get_base_name(joint)
-        if short_name == base_name:
-            return joint
+        name_map.setdefault(get_base_name(joint), joint)
+    return name_map
+
+def find_joint_by_base_name(base_name, root_joint, name_map=None):
+    """Find joints with the same base name under the specified root joint and return full path.
+
+    Returns None when not found - the caller decides how to report it.
+    """
+    if name_map is None:
+        name_map = get_joint_name_map(root_joint)
+    return name_map.get(base_name)
     
 
-    cmds.confirmDialog(
-    title='Cannot find joint error',
-    message= base_name + ' doesnot exist, please correct your json', 
-    button=['OK'],
-    icon='critical'
-    )
-    cmds.error(base_name + ' doesnot exist, please correct your json')
-    return None
 
 def get_joint_direction(joint_name):
     """Get the direction vector of the joint relative to its parent joint."""
@@ -304,34 +312,23 @@ def align_skeleton(joint_map, mh_root, daz_root):
     """Main function for aligning the skeleton."""
     processed_parents = set()
     error_joints = []
-    joint_aim_map = {}
-    joint_local_rot = {}
-
-    for mh_joint_name, daz_joint_name in joint_map.items():
-        daz_joint = find_joint_by_base_name(daz_joint_name, daz_root)
-        parent = cmds.listRelatives(daz_joint, parent=True, fullPath=True)
-        joint_aim_map[parent[0]] = getAimUpVector(parent[0],get_joint_direction(daz_joint))[0]
-        joint_local_rot[parent[0]] = getlocalRotation(parent[0])
-        if not daz_joint:
-            cmds.warning(f"⚠️ DAZ joint '{daz_joint_name}' not found under root '{get_base_name(daz_root)}'")
-            error_joints.append(daz_joint_name)
-            continue
+    mh_name_map = get_joint_name_map(mh_root)
+    daz_name_map = get_joint_name_map(daz_root)
 
     for mh_joint_name, daz_joint_name in joint_map.items():        
         # Find MetaHuman joints.
-        mh_joint = find_joint_by_base_name(mh_joint_name, mh_root)
+        mh_joint = find_joint_by_base_name(mh_joint_name, mh_root, mh_name_map)
         if not mh_joint:
             cmds.warning(f"⚠️ MetaHuman joint '{mh_joint_name}' not found under root '{get_base_name(mh_root)}'")
             error_joints.append(mh_joint_name)
             continue
         
         # Find DAZ joints.
-        daz_joint = find_joint_by_base_name(daz_joint_name, daz_root)        
+        daz_joint = find_joint_by_base_name(daz_joint_name, daz_root, daz_name_map)
         if not daz_joint:
             cmds.warning(f"⚠️ DAZ joint '{daz_joint_name}' not found under root '{get_base_name(daz_root)}'")
             error_joints.append(daz_joint_name)
             continue
-        print("find full path name {0},{1}".format(mh_joint,daz_joint))
         # Get the DAZ parent joint.
         daz_parents = cmds.listRelatives(daz_joint, parent=True, fullPath=True)
         if not daz_parents:
@@ -348,8 +345,6 @@ def align_skeleton(joint_map, mh_root, daz_root):
         
         # Apply the rotation
         try:
-            # rotate_joint_to_direction(daz_parent,joint_aim_map[daz_parent],target_direction)
-            # resetTwist(daz_parent,joint_local_rot[daz_parent],joint_aim_map[daz_parent])
             align_parent_to_vector(daz_joint,target_direction)
             processed_parents.add(daz_parent)
             cmds.warning(f"✅ Successfully aligned: {get_base_name(daz_parent)}")
@@ -683,7 +678,6 @@ def execute_alignment_cmd():
         cmds.warning("⚠️ MetaHuman and DAZ joint lists must be the same length")
         return
     
-    prefix = cmds.textField("dazNsField", query=True, text=True)
     for i in range(len(mh_joints)):
         joint_map[mh_joints[i]] = daz_joints[i]
     
@@ -693,12 +687,18 @@ def execute_alignment_cmd():
     #     if save_joint_map(json_path, joint_map):
     #         cmds.warning(f"💾 Map saved to {json_path}")
     
-    # Perform alignment
+    # Perform alignment (single undo step + exception-safe refresh)
     cmds.warning("🔧 Starting skeleton alignment...")
-    cmds.refresh(suspend=True)
-    align_skeleton(joint_map, mh_root, daz_root)
-    cmds.refresh(suspend=False)
-    cmds.refresh()
+    cmds.undoInfo(openChunk=True, chunkName="Align Skeletons")
+    try:
+        cmds.refresh(suspend=True)
+        align_skeleton(joint_map, mh_root, daz_root)
+    except Exception as e:
+        cmds.warning(f"⚠️ Alignment aborted: {str(e)}")
+    finally:
+        cmds.refresh(suspend=False)
+        cmds.refresh()
+        cmds.undoInfo(closeChunk=True)
     cmds.warning("✅ Done!")
 
 #endregion
